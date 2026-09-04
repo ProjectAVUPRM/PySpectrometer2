@@ -26,6 +26,7 @@ For instructions please consult the readme!
 """
 
 import cv2
+import subprocess
 import time
 import numpy as np
 from specFunctions import (
@@ -80,28 +81,67 @@ frameHeight = 600
 
 
 # init video
-# Pipeline GStreamer for the CSI camera in Jetson
-pipeline = "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
-# Initiate OpenCV using GStreamer
-cap = cv2.VideoCapture(
-    pipeline, cv2.CAP_GSTREAMER
-)  # for testing purposes, change this line for a different camera or video source.
+class GStreamerCamera:
+    def __init__(self, width=800, height=600):
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+        
+        # Pipeline idéntico al que funcionó en la terminal
+        self.gst_cmd = [
+            "gst-launch-1.0",
+            "nvarguscamerasrc", "sensor-id=0", "!",
+            "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1", "!",
+            "nvvidconv", "!",
+            f"video/x-raw, width={width}, height={height}, format=BGRx", "!",
+            "videoconvert", "!",
+            "video/x-raw, format=BGR", "!",
+            "queue", "max-size-buffers=1", "leaky=downstream", "!",
+            "filesink", "location=/dev/stdout"
+        ]
+        
+        self.process = subprocess.Popen(self.gst_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
+    def isOpened(self):
+        return self.process.poll() is None
+
+    def read(self):
+        if self.process.poll() is not None:
+            return False, None
+        # Leer exactamente los bytes correspondientes a un fotograma en BGR
+        raw_frame = self.process.stdout.read(self.frame_size)
+        if len(raw_frame) != self.frame_size:
+            return False, None
+        # Convertir los bytes a un arreglo de NumPy compatible con OpenCV
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return True, frame
+
+    def release(self):
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+
+# Variables que requiere PySpectrometer
+frameWidth = 800
+frameHeight = 600
+
+print("[Info] Iniciando puente de video por GStreamer para la IMX477...")
+cap = GStreamerCamera(frameWidth, frameHeight)
+
+if not cap.isOpened():
+    print("ERROR CRÍTICO: No se pudo abrir el stream de GStreamer.")
+    exit()
 
 print("[info] W, H, FPS")
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, frameWidth)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frameHeight)
-cap.set(cv2.CAP_PROP_FPS, fps)
-print(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-print(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-print(cap.get(cv2.CAP_PROP_FPS))
-cfps = cap.get(cv2.CAP_PROP_FPS)
+print(frameWidth)
+print(frameHeight)
+print(30)
 
 
 title1 = "PySpectrometer 2 - Spectrograph"
 title2 = "PySpectrometer 2 - Waterfall"
 stackHeight = (
-    320 + 80 + 80
+    320 + 200 + 80
 )  # height of the displayed CV window (graph+preview+messages)
 
 if dispWaterfall == True:
@@ -206,7 +246,7 @@ while cap.isOpened():
         y = int((frameHeight / 2) - 40)  # origin of the vertical crop
         # y=200 	#origin of the vert crop
         x = 0  # origin of the horiz crop
-        h = 80  # height of the crop
+        h = 200  # height of the crop
         w = frameWidth  # width of the crop
         cropped = frame[y : y + h, x : x + w]
         bwimage = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
@@ -457,7 +497,7 @@ while cap.isOpened():
         )
         cv2.putText(
             spectrum_vertical,
-            "Framerate: " + str(cfps),
+            "Framerate: " + str(fps),
             (490, 51),
             font,
             0.4,
