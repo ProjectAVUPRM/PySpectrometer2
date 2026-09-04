@@ -80,10 +80,14 @@ frameHeight = 600
 
 
 # init video
+# Pipeline GStreamer for the CSI camera in Jetson
+pipeline = "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! nvvidconv ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink"
+# Initiate OpenCV using GStreamer
 cap = cv2.VideoCapture(
-    "/dev/video" + str(dev), cv2.CAP_V4L
+    pipeline, cv2.CAP_GSTREAMER
 )  # for testing purposes, change this line for a different camera or video source.
-# cap = cv2.VideoCapture(0)
+
+
 print("[info] W, H, FPS")
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, frameWidth)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frameHeight)
