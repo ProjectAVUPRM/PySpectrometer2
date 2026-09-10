@@ -74,7 +74,7 @@ else:
 if args.fps:
     fps = args.fps
 else:
-    fps = 30
+    fps = 15
 
 frameWidth = 800
 frameHeight = 600
@@ -82,20 +82,17 @@ frameHeight = 600
 
 # init video
 class GStreamerCamera:
-    def __init__(self, width=800, height=600):
+    def __init__(self, width=640, height=360):
         self.width = width
         self.height = height
-        self.frame_size = width * height * 3
+        self.frame_size = width * height * 4 
         
-        # Pipeline idéntico al que funcionó en la terminal
         self.gst_cmd = [
             "gst-launch-1.0",
             "nvarguscamerasrc", "sensor-id=0", "!",
-            "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1", "!",
+            "video/x-raw(memory:NVMM), width=640, height=360, framerate=15/1", "!",
             "nvvidconv", "!",
             f"video/x-raw, width={width}, height={height}, format=BGRx", "!",
-            "videoconvert", "!",
-            "video/x-raw, format=BGR", "!",
             "queue", "max-size-buffers=1", "leaky=downstream", "!",
             "filesink", "location=/dev/stdout"
         ]
@@ -108,12 +105,14 @@ class GStreamerCamera:
     def read(self):
         if self.process.poll() is not None:
             return False, None
-        # Leer exactamente los bytes correspondientes a un fotograma en BGR
+        
         raw_frame = self.process.stdout.read(self.frame_size)
         if len(raw_frame) != self.frame_size:
             return False, None
-        # Convertir los bytes a un arreglo de NumPy compatible con OpenCV
-        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
+            
+        # Leemos como BGRA/BGRx (4 canales) y luego descartamos el canal alfa con OpenCV instantáneamente
+        frame_bgra = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 4))
+        frame = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR) # OpenCV maneja esta conversión con optimización interna
         return True, frame
 
     def release(self):
@@ -121,9 +120,6 @@ class GStreamerCamera:
             self.process.terminate()
             self.process.wait()
 
-# Variables que requiere PySpectrometer
-frameWidth = 800
-frameHeight = 600
 
 print("[Info] Iniciando puente de video por GStreamer para la IMX477...")
 cap = GStreamerCamera(frameWidth, frameHeight)
@@ -135,7 +131,7 @@ if not cap.isOpened():
 print("[info] W, H, FPS")
 print(frameWidth)
 print(frameHeight)
-print(30)
+print(15)
 
 
 title1 = "PySpectrometer 2 - Spectrograph"
