@@ -48,7 +48,7 @@ parser.add_argument(
     default=0,
     help="Video Device number e.g. 0, use v4l2-ctl --list-devices",
 )
-parser.add_argument("--fps", type=int, default=30, help="Frame Rate e.g. 30")
+parser.add_argument("--fps", type=int, default=15, help="Frame Rate e.g. 30")
 group = parser.add_mutually_exclusive_group()
 group.add_argument(
     "--fullscreen", help="Fullscreen (Native 800*480)", action="store_true"
@@ -110,9 +110,9 @@ class GStreamerCamera:
         if len(raw_frame) != self.frame_size:
             return False, None
             
-        # Leemos como BGRA/BGRx (4 canales) y luego descartamos el canal alfa con OpenCV instantáneamente
+        # Leemos como BGRA/BGRx (4 canales) y descartamos el canal alfa con OpenCV
         frame_bgra = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 4))
-        frame = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR) # OpenCV maneja esta conversión con optimización interna
+        frame = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
         return True, frame
 
     def release(self):
@@ -122,7 +122,7 @@ class GStreamerCamera:
 
 
 print("[Info] Iniciando puente de video por GStreamer para la IMX477...")
-cap = GStreamerCamera(frameWidth, frameHeight)
+cap = GStreamerCamera(800, 600)
 
 if not cap.isOpened():
     print("ERROR CRÍTICO: No se pudo abrir el stream de GStreamer.")
@@ -131,7 +131,7 @@ if not cap.isOpened():
 print("[info] W, H, FPS")
 print(frameWidth)
 print(frameHeight)
-print(15)
+print(fps)
 
 
 title1 = "PySpectrometer 2 - Spectrograph"
@@ -186,7 +186,7 @@ cv2.setMouseCallback(title1, handle_mouse)
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 
-intensity = [0] * frameWidth  # array for intensity data...full of zeroes
+intensity = np.zeros(frameWidth, dtype=float)  # array for intensity data... full of zeroes
 
 holdpeaks = False  # are we holding peaks?
 measure = False  # are we measuring?
@@ -236,9 +236,10 @@ def snapshot(savedata):
 
 while cap.isOpened():
     # Capture frame-by-frame
-    ret, frame = cap.read()
+    ret, raw_frame = cap.read()
 
     if ret == True:
+        frame = cv2.resize(raw_frame, (frameWidth, frameHeight))
         y = int((frameHeight / 2) - 40)  # origin of the vertical crop
         # y=200 	#origin of the vert crop
         x = 0  # origin of the horiz crop
@@ -261,7 +262,9 @@ while cap.isOpened():
         decoded_data = base64.b64decode(background)
         np_data = np.frombuffer(decoded_data, np.uint8)
         img = cv2.imdecode(np_data, 3)
-        messages = img
+        
+        # Forzamos a que el banner mida 800 de ancho y 80 de alto (exactamente el espacio superior)
+        messages = cv2.resize(img, (frameWidth, 80))
 
         # blank image for Graph
         graph = np.zeros([320, frameWidth, 3], dtype=np.uint8)
@@ -466,6 +469,9 @@ while cap.isOpened():
                 )
 
         # stack the images and display the spectrum
+        # print(f"Shape messages: {messages.shape}")
+        # print(f"Shape cropped:  {cropped.shape}")
+        # print(f"Shape graph:    {graph.shape}")
         spectrum_vertical = np.vstack((messages, cropped, graph))
         # dividing lines...
         cv2.line(spectrum_vertical, (0, 80), (frameWidth, 80), (255, 255, 255), 1)
