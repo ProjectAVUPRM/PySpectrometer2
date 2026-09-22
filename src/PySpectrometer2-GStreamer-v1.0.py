@@ -23,10 +23,20 @@ All old features have been kept, including peak hold, peak detect, Savitsky Gola
 
 For instructions please consult the readme!
 
+--- MODIFICADO ---
+Se reemplazo la clase GStreamerCamera (que leia el pipe crudo de gst-launch-1.0
+via subprocess y hacia un reshape manual) por cv2.VideoCapture + appsink.
+
+Motivo: nvvidconv en Jetson puede alinear (pad) cada fila del buffer a un
+multiplo de bytes distinto de width*4. El reshape manual asumia stride =
+width*4 exacto, y cuando el stride real tenia relleno extra, ese relleno se
+interpretaba como pixeles, provocando que un fragmento del lado derecho de
+cada fila apareciera "enrollado" al lado izquierdo de la fila siguiente
+(el efecto de corte/repeticion en el borde izquierdo que se ve en pantalla).
+appsink delega el manejo del stride a GStreamer/OpenCV, evitando el bug de raiz.
 """
 
 import cv2
-import subprocess
 import time
 import numpy as np
 from specFunctions import (
@@ -80,52 +90,30 @@ frameWidth = 800
 frameHeight = 600
 
 
-# init video
-class GStreamerCamera:
-    def __init__(self, width=640, height=360):
-        self.width = width
-        self.height = height
-        self.frame_size = width * height * 4 
-        
-        self.gst_cmd = [
-            "gst-launch-1.0",
-            "nvarguscamerasrc", "sensor-id=0", "!",
-            f"video/x-raw(memory:NVMM), width={width}, height={height}, framerate=15/1", "!",
-            "nvvidconv", "!",
-            f"video/x-raw, width={width}, height={height}, format=BGRx", "!",
-            "queue", "max-size-buffers=1", "leaky=downstream", "!",
-            "filesink", "location=/dev/stdout"
-        ]
-        
-        self.process = subprocess.Popen(self.gst_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    def isOpened(self):
-        return self.process.poll() is None
-
-    def read(self):
-        if self.process.poll() is not None:
-            return False, None
-        
-        raw_frame = self.process.stdout.read(self.frame_size)
-        if len(raw_frame) != self.frame_size:
-            return False, None
-            
-        # Leemos como BGRA/BGRx (4 canales) y descartamos el canal alfa con OpenCV
-        frame_bgra = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 4))
-        frame = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
-        return True, frame
-
-    def release(self):
-        if self.process:
-            self.process.terminate()
-            self.process.wait()
+def build_gst_pipeline(width, height, fps, sensor_id=0, flip_method=0):
+    """
+    Pipeline GStreamer que termina en appsink en vez de filesink+stdout.
+    OpenCV (y GStreamer) se encargan del stride internamente, por lo que
+    no hace falta reshape manual ni riesgo de desalineamiento de filas.
+    """
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM), width=(int){width}, height=(int){height}, "
+        f"framerate=(fraction){fps}/1 ! "
+        f"nvvidconv flip-method={flip_method} ! "
+        f"video/x-raw, width=(int){width}, height=(int){height}, format=(string)BGRx ! "
+        f"videoconvert ! "
+        f"video/x-raw, format=(string)BGR ! "
+        f"appsink drop=true sync=false max-buffers=1"
+    )
 
 
-print("[Info] Iniciando puente de video por GStreamer para la IMX477...")
-cap = GStreamerCamera(800, 600)
+print("[Info] Iniciando video via GStreamer/appsink para la IMX477...")
+gst_str = build_gst_pipeline(frameWidth, frameHeight, fps)
+cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
 
 if not cap.isOpened():
-    print("ERROR CRÍTICO: No se pudo abrir el stream de GStreamer.")
+    print("ERROR CRITICO: No se pudo abrir el stream de GStreamer.")
     exit()
 
 print("[info] W, H, FPS")
@@ -186,7 +174,7 @@ cv2.setMouseCallback(title1, handle_mouse)
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 
-intensity = np.zeros(frameWidth, dtype=float)  # array for intensity data... full of zeroes
+intensity = [0] * frameWidth  # array for intensity data...full of zeroes
 
 holdpeaks = False  # are we holding peaks?
 measure = False  # are we measuring?
@@ -223,8 +211,6 @@ def snapshot(savedata):
         imdata2 = savedata[2]
         cv2.imwrite("waterfall-" + now + ".png", imdata2)
     cv2.imwrite("spectrum-" + now + ".png", imdata1)
-    # print(graphdata[0]) #wavelengths
-    # print(graphdata[1]) #intensities
     f = open("Spectrum-" + now + ".csv", "w")
     f.write("Wavelength,Intensity\r\n")
     for x in zip(graphdata[0], graphdata[1]):
@@ -236,12 +222,10 @@ def snapshot(savedata):
 
 while cap.isOpened():
     # Capture frame-by-frame
-    ret, raw_frame = cap.read()
+    ret, frame = cap.read()
 
     if ret == True:
-        frame = cv2.resize(raw_frame, (frameWidth, frameHeight))
         y = int((frameHeight / 2) - 40)  # origin of the vertical crop
-        # y=200 	#origin of the vert crop
         x = 0  # origin of the horiz crop
         h = 80  # height of the crop
         w = frameWidth  # width of the crop
@@ -262,9 +246,7 @@ while cap.isOpened():
         decoded_data = base64.b64decode(background)
         np_data = np.frombuffer(decoded_data, np.uint8)
         img = cv2.imdecode(np_data, 3)
-        
-        # Forzamos a que el banner mida 800 de ancho y 80 de alto (exactamente el espacio superior)
-        messages = cv2.resize(img, (frameWidth, 80))
+        messages = img
 
         # blank image for Graph
         graph = np.zeros([320, frameWidth, 3], dtype=np.uint8)
@@ -272,11 +254,9 @@ while cap.isOpened():
 
         # Display a graticule calibrated with cal data
         textoffset = 12
-        # vertial lines every whole 10nm
         for position in tens:
             cv2.line(graph, (position, 15), (position, 320), (200, 200, 200), 1)
 
-        # vertical lines every whole 50nm
         for positiondata in fifties:
             cv2.line(graph, (positiondata[0], 15), (positiondata[0], 320), (0, 0, 0), 1)
             cv2.putText(
@@ -290,17 +270,13 @@ while cap.isOpened():
                 cv2.LINE_AA,
             )
 
-        # horizontal lines
         for i in range(320):
             if i >= 64:
                 if i % 64 == 0:  # suppress the first line then draw the rest...
                     cv2.line(graph, (0, i), (frameWidth, i), (100, 100, 100), 1)
 
         # Now process the intensity data and display it
-        # intensity = []
         for i in range(cols):
-            # data = bwimage[halfway,i] #pull the pixel data from the halfway mark
-            # print(type(data)) #numpy.uint8
             # average the data of 3 rows of pixels:
             dataminus1 = bwimage[halfway - 1, i]
             datazero = bwimage[halfway, i]  # pull the pixel data from the halfway mark
@@ -315,32 +291,20 @@ while cap.isOpened():
                 intensity[i] = data
 
         if dispWaterfall == True:
-            # waterfall....
-            # data is smoothed at this point!!!!!!
-            # create an empty array for the data
             wdata = np.zeros([1, frameWidth, 3], dtype=np.uint8)
             index = 0
             for i in intensity:
-                rgb = wavelength_to_rgb(
-                    round(wavelengthData[index])
-                )  # derive the color from the wavelenthData array
+                rgb = wavelength_to_rgb(round(wavelengthData[index]))
                 luminosity = intensity[index] / 255
                 b = int(round(rgb[0] * luminosity))
                 g = int(round(rgb[1] * luminosity))
                 r = int(round(rgb[2] * luminosity))
-                # print(b,g,r)
-                # wdata[0,index]=(r,g,b) #fix me!!! how do we deal with this data??
                 wdata[0, index] = (r, g, b)
                 index += 1
-            waterfall = np.insert(
-                waterfall, 0, wdata, axis=0
-            )  # insert line to beginning of array
-            waterfall = waterfall[:-1].copy()  # remove last element from array
+            waterfall = np.insert(waterfall, 0, wdata, axis=0)
+            waterfall = waterfall[:-1].copy()
 
             hsv = cv2.cvtColor(waterfall, cv2.COLOR_BGR2HSV)
-
-        # Draw the intensity data :-)
-        # first filter if not holding peaks!
 
         if holdpeaks == False:
             intensity = savitzky_golay(intensity, 17, savpoly)
@@ -350,29 +314,20 @@ while cap.isOpened():
         else:
             holdmsg = "Holdpeaks ON"
 
-        # now draw the intensity data....
         index = 0
         for i in intensity:
-            rgb = wavelength_to_rgb(
-                round(wavelengthData[index])
-            )  # derive the color from the wvalenthData array
+            rgb = wavelength_to_rgb(round(wavelengthData[index]))
             r = rgb[0]
             g = rgb[1]
             b = rgb[2]
-            # or some reason origin is top left.
             cv2.line(graph, (index, 320), (index, 320 - i), (b, g, r), 1)
-            cv2.line(
-                graph, (index, 319 - i), (index, 320 - i), (0, 0, 0), 1, cv2.LINE_AA
-            )
+            cv2.line(graph, (index, 319 - i), (index, 320 - i), (0, 0, 0), 1, cv2.LINE_AA)
             index += 1
 
         # find peaks and label them
         textoffset = 12
-        thresh = int(thresh)  # make sure the data is int.
-        indexes = peakIndexes(
-            intensity, thres=thresh / max(intensity), min_dist=mindist
-        )
-        # print(indexes)
+        thresh = int(thresh)
+        indexes = peakIndexes(intensity, thres=thresh / max(intensity), min_dist=mindist)
         for i in indexes:
             height = intensity[i]
             height = 310 - height
@@ -401,20 +356,12 @@ while cap.isOpened():
                 1,
                 cv2.LINE_AA,
             )
-            # flagpoles
             cv2.line(graph, (i, height), (i, height + 10), (0, 0, 0), 1)
 
         if measure == True:
-            # show the cursor!
+            cv2.line(graph, (cursorX, cursorY - 140), (cursorX, cursorY - 180), (0, 0, 0), 1)
             cv2.line(
-                graph, (cursorX, cursorY - 140), (cursorX, cursorY - 180), (0, 0, 0), 1
-            )
-            cv2.line(
-                graph,
-                (cursorX - 20, cursorY - 160),
-                (cursorX + 20, cursorY - 160),
-                (0, 0, 0),
-                1,
+                graph, (cursorX - 20, cursorY - 160), (cursorX + 20, cursorY - 160), (0, 0, 0), 1
             )
             cv2.putText(
                 graph,
@@ -428,16 +375,9 @@ while cap.isOpened():
             )
 
         if recPixels == True:
-            # display the points
+            cv2.line(graph, (cursorX, cursorY - 140), (cursorX, cursorY - 180), (0, 0, 0), 1)
             cv2.line(
-                graph, (cursorX, cursorY - 140), (cursorX, cursorY - 180), (0, 0, 0), 1
-            )
-            cv2.line(
-                graph,
-                (cursorX - 20, cursorY - 160),
-                (cursorX + 20, cursorY - 160),
-                (0, 0, 0),
-                1,
+                graph, (cursorX - 20, cursorY - 160), (cursorX + 20, cursorY - 160), (0, 0, 0), 1
             )
             cv2.putText(
                 graph,
@@ -450,7 +390,6 @@ while cap.isOpened():
                 cv2.LINE_AA,
             )
         else:
-            # also make sure the click array stays empty
             clickArray = []
 
         if clickArray:
@@ -458,7 +397,6 @@ while cap.isOpened():
                 mouseX = data[0]
                 mouseY = data[1]
                 cv2.circle(graph, (mouseX, mouseY), 5, (0, 0, 0), -1)
-                # we can display text :-) so we can work out wavelength from x-pos and display it ultimately
                 cv2.putText(
                     graph,
                     str(mouseX),
@@ -469,212 +407,49 @@ while cap.isOpened():
                 )
 
         # stack the images and display the spectrum
-        # print(f"Shape messages: {messages.shape}")
-        # print(f"Shape cropped:  {cropped.shape}")
-        # print(f"Shape graph:    {graph.shape}")
         spectrum_vertical = np.vstack((messages, cropped, graph))
-        # dividing lines...
         cv2.line(spectrum_vertical, (0, 80), (frameWidth, 80), (255, 255, 255), 1)
         cv2.line(spectrum_vertical, (0, 160), (frameWidth, 160), (255, 255, 255), 1)
-        # print the messages
-        cv2.putText(
-            spectrum_vertical,
-            calmsg1,
-            (490, 15),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            spectrum_vertical,
-            calmsg3,
-            (490, 33),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            spectrum_vertical,
-            "Framerate: " + str(fps),
-            (490, 51),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            spectrum_vertical,
-            saveMsg,
-            (490, 69),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        # Second column
-        cv2.putText(
-            spectrum_vertical,
-            holdmsg,
-            (640, 15),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            spectrum_vertical,
-            "Savgol Filter: " + str(savpoly),
-            (640, 33),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            spectrum_vertical,
-            "Label Peak Width: " + str(mindist),
-            (640, 51),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            spectrum_vertical,
-            "Label Threshold: " + str(thresh),
-            (640, 69),
-            font,
-            0.4,
-            (0, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(spectrum_vertical, calmsg1, (490, 15), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, calmsg3, (490, 33), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, "Framerate: " + str(fps), (490, 51), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, saveMsg, (490, 69), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, holdmsg, (640, 15), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, "Savgol Filter: " + str(savpoly), (640, 33), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, "Label Peak Width: " + str(mindist), (640, 51), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(spectrum_vertical, "Label Threshold: " + str(thresh), (640, 69), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(title1, spectrum_vertical)
 
         if dispWaterfall == True:
-            # stack the images and display the waterfall
             waterfall_vertical = np.vstack((messages, cropped, waterfall))
-            # dividing lines...
             cv2.line(waterfall_vertical, (0, 80), (frameWidth, 80), (255, 255, 255), 1)
-            cv2.line(
-                waterfall_vertical, (0, 160), (frameWidth, 160), (255, 255, 255), 1
-            )
-            # Draw this stuff over the top of the image!
-            # Display a graticule calibrated with cal data
+            cv2.line(waterfall_vertical, (0, 160), (frameWidth, 160), (255, 255, 255), 1)
             textoffset = 12
 
-            # vertical lines every whole 50nm
             for positiondata in fifties:
                 for i in range(162, 480):
                     if i % 20 == 0:
-                        cv2.line(
-                            waterfall_vertical,
-                            (positiondata[0], i),
-                            (positiondata[0], i + 1),
-                            (0, 0, 0),
-                            2,
-                        )
-                        cv2.line(
-                            waterfall_vertical,
-                            (positiondata[0], i),
-                            (positiondata[0], i + 1),
-                            (255, 255, 255),
-                            1,
-                        )
-                cv2.putText(
-                    waterfall_vertical,
-                    str(positiondata[1]) + "nm",
-                    (positiondata[0] - textoffset, 475),
-                    font,
-                    0.4,
-                    (0, 0, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    waterfall_vertical,
-                    str(positiondata[1]) + "nm",
-                    (positiondata[0] - textoffset, 475),
-                    font,
-                    0.4,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                        cv2.line(waterfall_vertical, (positiondata[0], i), (positiondata[0], i + 1), (0, 0, 0), 2)
+                        cv2.line(waterfall_vertical, (positiondata[0], i), (positiondata[0], i + 1), (255, 255, 255), 1)
+                cv2.putText(waterfall_vertical, str(positiondata[1]) + "nm", (positiondata[0] - textoffset, 475), font, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(waterfall_vertical, str(positiondata[1]) + "nm", (positiondata[0] - textoffset, 475), font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
-            cv2.putText(
-                waterfall_vertical,
-                calmsg1,
-                (490, 15),
-                font,
-                0.4,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                waterfall_vertical,
-                calmsg2,
-                (490, 33),
-                font,
-                0.4,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                waterfall_vertical,
-                calmsg3,
-                (490, 51),
-                font,
-                0.4,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                waterfall_vertical,
-                saveMsg,
-                (490, 69),
-                font,
-                0.4,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-            cv2.putText(
-                waterfall_vertical,
-                holdmsg,
-                (640, 15),
-                font,
-                0.4,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.putText(waterfall_vertical, calmsg1, (490, 15), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(waterfall_vertical, calmsg2, (490, 33), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(waterfall_vertical, calmsg3, (490, 51), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(waterfall_vertical, saveMsg, (490, 69), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(waterfall_vertical, holdmsg, (640, 15), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
             cv2.imshow(title2, waterfall_vertical)
+
+        
 
         keyPress = cv2.waitKey(1)
         if keyPress == ord("q"):
             break
         elif keyPress == ord("h"):
-            if holdpeaks == False:
-                holdpeaks = True
-            elif holdpeaks == True:
-                holdpeaks = False
+            holdpeaks = not holdpeaks
         elif keyPress == ord("s"):
-            # package up the data!
             graphdata = []
             graphdata.append(wavelengthData)
             graphdata.append(intensity)
@@ -691,52 +466,43 @@ while cap.isOpened():
         elif keyPress == ord("c"):
             calcomplete = writecal(clickArray)
             if calcomplete:
-                # overwrite wavelength data
-                # Go grab the computed calibration data
                 caldata = readcal(frameWidth)
                 wavelengthData = caldata[0]
                 calmsg1 = caldata[1]
                 calmsg2 = caldata[2]
                 calmsg3 = caldata[3]
-                # overwrite graticule data
                 graticuleData = generateGraticule(wavelengthData)
                 tens = graticuleData[0]
                 fifties = graticuleData[1]
         elif keyPress == ord("x"):
             clickArray = []
         elif keyPress == ord("m"):
-            recPixels = False  # turn off recpixels!
-            if measure == False:
-                measure = True
-            elif measure == True:
-                measure = False
+            recPixels = False
+            measure = not measure
         elif keyPress == ord("p"):
-            measure = False  # turn off measure!
-            if recPixels == False:
-                recPixels = True
-            elif recPixels == True:
-                recPixels = False
-        elif keyPress == ord("o"):  # sav up
+            measure = False
+            recPixels = not recPixels
+        elif keyPress == ord("o"):
             savpoly += 1
             if savpoly >= 15:
                 savpoly = 15
-        elif keyPress == ord("l"):  # sav down
+        elif keyPress == ord("l"):
             savpoly -= 1
             if savpoly <= 0:
                 savpoly = 0
-        elif keyPress == ord("i"):  # Peak width up
+        elif keyPress == ord("i"):
             mindist += 1
             if mindist >= 100:
                 mindist = 100
-        elif keyPress == ord("k"):  # Peak Width down
+        elif keyPress == ord("k"):
             mindist -= 1
             if mindist <= 0:
                 mindist = 0
-        elif keyPress == ord("u"):  # label thresh up
+        elif keyPress == ord("u"):
             thresh += 1
             if thresh >= 100:
                 thresh = 100
-        elif keyPress == ord("j"):  # label thresh down
+        elif keyPress == ord("j"):
             thresh -= 1
             if thresh <= 0:
                 thresh = 0
@@ -746,5 +512,4 @@ while cap.isOpened():
 
 # Everything done, release the vid
 cap.release()
-
 cv2.destroyAllWindows()
