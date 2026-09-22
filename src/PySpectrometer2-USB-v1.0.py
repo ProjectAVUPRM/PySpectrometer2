@@ -23,6 +23,9 @@ All old features have been kept, including peak hold, peak detect, Savitsky Gola
 
 For instructions please consult the readme!
 
+IMPORTANT: THIS WAS THE OLD IMPLEMENTATION, IF SOMEHOW ONE OF YOU GUYS FUTURE SOFTWARE DIVISION MEMBERS END UP USING A USB CAMERA CONSIDER REVERTING THIS FILE TO ITS ORIGINAL STATE
+BY COPY/PASTING IT FROM THE ORIGINAL PYSPECTROMETER2 REPO (im lazy to do it sorry).
+
 """
 
 import cv2
