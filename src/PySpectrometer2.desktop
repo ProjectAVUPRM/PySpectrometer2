@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PySpectrometer 2
+Comment=Abrir el espectrometro, Copia este .desktop al Desktop (duh) y ajusta la ruta de ser necesario
+Exec=/home/projectav/project_av/PySpectrometer2/src/launch_pyspectrometer.sh
+Icon=utilities-terminal
+Terminal=true
+Categories=Utility;
