@@ -38,6 +38,7 @@ appsink delega el manejo del stride a GStreamer/OpenCV, evitando el bug de raiz.
 
 import cv2
 import time
+import threading
 import numpy as np
 from specFunctions import (
     wavelength_to_rgb,
@@ -50,6 +51,86 @@ from specFunctions import (
 )
 import base64
 import argparse
+
+# --- API: dependencies to expose teh video via http ---
+import uvicorn
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, HTMLResponse
+
+# --- API: shared state between the OpenCV loop and the FastAPI server ---
+api_app = FastAPI()
+api_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+frame_lock = threading.Lock()
+latest_jpeg = {"spectrum": None, "waterfall": None}
+
+def encode_and_store(name, img, quality=80):
+    try:
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    except Exception as e:
+        print(f"[API-DEBUG] EXCEPCION codificando '{name}':{e}")
+        return
+    if ok:
+        with frame_lock:
+            latest_jpeg[name] = buf.tobytes()
+ 
+def mjpeg_generator(name):
+    boundary = b"--frame\r\n"
+    while True:
+        with frame_lock:
+            frame = latest_jpeg.get(name)
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        yield (boundary + b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+        time.sleep(1/30) # -30fps output cap, independet of capture fps
+
+@api_app.get("/", response_class=HTMLResponse)
+def index():
+    return """
+    <html>
+    <head><title>PySpectrometer 2 - Live</title></head>
+    <body style="margin:0; background:#000; text-align:center;">
+        <h3 style="color:#0f0; font-family:sans-serif;">Spectrograph</h3>
+        <img src="/video_feed" style="max-width:100%" />
+        <h3 style="color:#0f0; font-family:sans-serif;">Waterfall</h3>
+        <img src="/video_feed_waterfall" style="max-width:100%" />
+    </body>
+</html>
+"""
+
+@api_app.get("/video_feed")
+def video_feed():
+    return StreamingResponse(
+        mjpeg_generator("spectrum"),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@api_app.get("/video_feed_waterfall")
+def video_feed_waterfall():
+    return StreamingResponse(
+        mjpeg_generator("waterfall"),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@api_app.get("/snapshot.jpg")
+def snapshot_jpg():
+    with frame_lock:
+        frame = latest_jpeg.get("spectrum")
+    if frame is None:
+        return Response(status_code=503)
+    return Response(content=frame, media_type="image/jpeg")
+
+def start_api_server(host="0.0.0.0", port=8000):
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    uvicorn.run(api_app, host=host, port=port, log_level="warning")
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -115,6 +196,12 @@ cap = cv2.VideoCapture(gst_str, cv2.CAP_GSTREAMER)
 if not cap.isOpened():
     print("ERROR CRITICO: No se pudo abrir el stream de GStreamer.")
     exit()
+
+# --- API: Start FastAPI sever in background ---
+
+api_thread = threading.Thread(target=start_api_server, kwargs={"port": 8000}, daemon=True)
+api_thread.start()
+print("[info] API de video disponible en http://0.0.0.0:8000/video_feed")
 
 print("[info] W, H, FPS")
 print(frameWidth)
@@ -419,6 +506,7 @@ while cap.isOpened():
         cv2.putText(spectrum_vertical, "Label Peak Width: " + str(mindist), (640, 51), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(spectrum_vertical, "Label Threshold: " + str(thresh), (640, 69), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow(title1, spectrum_vertical)
+        encode_and_store("spectrum", spectrum_vertical) #API: publish frame
 
         if dispWaterfall == True:
             waterfall_vertical = np.vstack((messages, cropped, waterfall))
@@ -441,6 +529,7 @@ while cap.isOpened():
             cv2.putText(waterfall_vertical, holdmsg, (640, 15), font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
             cv2.imshow(title2, waterfall_vertical)
+            encode_and_store("waterfall", waterfall_vertical)
 
         
 
